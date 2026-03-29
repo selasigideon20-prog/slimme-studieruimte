@@ -1,33 +1,348 @@
-Slimme Studieruimte
-Doel
-Het doel van dit project is om een slimme studieruimte te maken die automatisch detecteert hoeveel personen aanwezig zijn en de status bepaalt.
+#define BLYNK_TEMPLATE_ID "TMPL5Eu5Xzma5"
+#define BLYNK_TEMPLATE_NAME "studieruimte"
+#define BLYNK_AUTH_TOKEN "dqnC16epvgg8S1Uj4-rdwH4lEaUSZHQg"
 
-Werking
-De ESP32 gebruikt twee IR-sensoren:
+#include <LiquidCrystal.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
 
-één aan de ingang
-één aan de uitgang
-Wanneer iemand binnenkomt, wordt het aantal verhoogd.
-Wanneer iemand buitengaat, wordt het aantal verlaagd.
+#define IN_SENSOR    4
+#define OUT_SENSOR   19
+#define SOUND_PIN    2
 
-Op basis van het aantal personen bepaalt het systeem:
+#define RED_LED      21
+#define GREEN_LED    20
+#define BLUE_LED     22
+#define BUZZER       8
+#define BUTTON_PIN   10
 
-Vrij
-Bezet
-Vol
-Daarnaast wordt er een geluidssensor gebruikt.
-Als het te luid wordt, geeft het systeem een waarschuwing met een buzzer.
+LiquidCrystal lcd(12, 5, 6, 7, 15, 18);
 
-De status wordt weergegeven op:
+char ssid[] = "telenet-8CE4526";
+char password[] = "d4Wcunppeejj";
 
-LED’s
-LCD scherm
-Blynk app
-Componenten
-ESP32
-2x IR sensor
-Geluidssensor
-LCD scherm
-LEDs
-Buzzer
-Drukknop
+int aantal = 0;
+const int MAX_PERSONEN = 5;
+
+bool inArmed = true;
+bool outArmed = true;
+bool nietStoren = false;
+bool lastButtonState = HIGH;
+bool lawaaiMelding = false;
+
+unsigned long lastInTrigger = 0;
+unsigned long lastOutTrigger = 0;
+unsigned long lastButtonTime = 0;
+unsigned long lastBeep = 0;
+unsigned long lawaaiTot = 0;
+unsigned long laatsteLawaaiTijd = 0;
+unsigned long meldingTot = 0;
+unsigned long lastBlynkUpdate = 0;
+
+const unsigned long sensorCooldown = 1500;
+const unsigned long beepCooldown = 1200;
+const unsigned long lawaaiResetTijd = 15000;
+const unsigned long blynkUpdateInterval = 1000;
+
+int lawaaiLevel = 0;
+
+String lijn1 = "";
+String lijn2 = "";
+String vorigeStatus = "";
+
+// ---------- HELPERS ----------
+String getStatusText() {
+  if (nietStoren) return "Niet storen";
+  if (aantal == 0) return "Vrij";
+  if (aantal < MAX_PERSONEN) return "Bezet";
+  return "Vol";
+}
+
+void showTemp(String l1, String l2, int tijd = 1500) {
+  lijn1 = l1;
+  lijn2 = l2;
+  meldingTot = millis() + tijd;
+}
+
+void updateBlynkDisplay() {
+  Blynk.virtualWrite(V4, aantal);
+  Blynk.virtualWrite(V3, getStatusText());
+}
+
+void beepKort() {
+  if (millis() - lastBeep > beepCooldown) {
+    digitalWrite(BUZZER, HIGH);
+    delay(80);
+    digitalWrite(BUZZER, LOW);
+    lastBeep = millis();
+  }
+}
+
+void beepDubbel() {
+  if (millis() - lastBeep > beepCooldown) {
+    digitalWrite(BUZZER, HIGH);
+    delay(70);
+    digitalWrite(BUZZER, LOW);
+    delay(70);
+    digitalWrite(BUZZER, HIGH);
+    delay(70);
+    digitalWrite(BUZZER, LOW);
+    lastBeep = millis();
+  }
+}
+
+void beepLang() {
+  if (millis() - lastBeep > beepCooldown) {
+    digitalWrite(BUZZER, HIGH);
+    delay(220);
+    digitalWrite(BUZZER, LOW);
+    lastBeep = millis();
+  }
+}
+
+// ---------- BLYNK ----------
+BLYNK_WRITE(V0) {
+  if (param.asInt() == 1) {
+    nietStoren = true;
+    showTemp("Niet storen", "Blynk AAN");
+    updateBlynkDisplay();
+  }
+}
+
+BLYNK_WRITE(V1) {
+  if (param.asInt() == 1) {
+    nietStoren = false;
+    showTemp("Niet storen", "Blynk UIT");
+    updateBlynkDisplay();
+  }
+}
+
+BLYNK_WRITE(V2) {
+  if (param.asInt() == 1) {
+    aantal = 0;
+    beepLang();
+    showTemp("Reset", "Aantal = 0");
+    updateBlynkDisplay();
+  }
+}
+
+// ---------- INPUTS ----------
+void handleButton() {
+  bool buttonState = digitalRead(BUTTON_PIN);
+
+  if (buttonState == LOW && lastButtonState == HIGH && millis() - lastButtonTime > 300) {
+    nietStoren = !nietStoren;
+    lastButtonTime = millis();
+    beepKort();
+
+    if (nietStoren) {
+      showTemp("Niet storen", "Actief");
+    } else {
+      showTemp("Niet storen", "Uit");
+    }
+
+    updateBlynkDisplay();
+  }
+
+  lastButtonState = buttonState;
+}
+
+void handleCounter() {
+  unsigned long now = millis();
+
+  bool inStatus = digitalRead(IN_SENSOR) == LOW;
+  bool outStatus = digitalRead(OUT_SENSOR) == LOW;
+
+  if (inArmed && inStatus && (now - lastInTrigger > sensorCooldown)) {
+    if (aantal < MAX_PERSONEN) {
+      aantal++;
+      Serial.print("BINNEN -> ");
+      Serial.println(aantal);
+      beepKort();
+      showTemp("Welkom", "+1 persoon");
+    } else {
+      beepLang();
+      showTemp("Ruimte vol", "Geen plaats");
+    }
+
+    lastInTrigger = now;
+    inArmed = false;
+    updateBlynkDisplay();
+  }
+
+  if (outArmed && outStatus && (now - lastOutTrigger > sensorCooldown)) {
+    if (aantal > 0) {
+      aantal--;
+      Serial.print("BUITEN -> ");
+      Serial.println(aantal);
+      beepDubbel();
+      showTemp("Tot straks", "-1 persoon");
+    }
+
+    lastOutTrigger = now;
+    outArmed = false;
+    updateBlynkDisplay();
+  }
+
+  if (!inStatus) inArmed = true;
+  if (!outStatus) outArmed = true;
+}
+
+void handleSound() {
+  int geluid = analogRead(SOUND_PIN);
+
+  if (millis() - laatsteLawaaiTijd > lawaaiResetTijd) {
+    lawaaiLevel = 0;
+  }
+
+  if (geluid > 2000 && nietStoren && aantal > 0) {
+    if (millis() - laatsteLawaaiTijd > 2000) {
+      lawaaiLevel++;
+      laatsteLawaaiTijd = millis();
+
+      if (lawaaiLevel == 1) {
+        lawaaiMelding = true;
+        lawaaiTot = millis() + 2000;
+        showTemp("Te luid", "Waarschuwing 1", 1200);
+        beepKort();
+      } 
+      else if (lawaaiLevel == 2) {
+        lawaaiMelding = true;
+        lawaaiTot = millis() + 2500;
+        showTemp("Te luid", "Laatste waars.", 1400);
+        beepLang();
+      } 
+      else {
+        lawaaiMelding = true;
+        lawaaiTot = millis() + 3000;
+        showTemp("Te luid", "Rustig aub", 1500);
+        beepLang();
+        lawaaiLevel = 0;
+      }
+    }
+  }
+
+  if (millis() > lawaaiTot) {
+    lawaaiMelding = false;
+  }
+}
+
+// ---------- OUTPUT ----------
+void updateDisplayAndLeds() {
+  int vrij = MAX_PERSONEN - aantal;
+  if (vrij < 0) vrij = 0;
+
+  if (lawaaiMelding) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(BLUE_LED, LOW);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Te luid        ");
+    lcd.setCursor(0, 1);
+    lcd.print("Rustig aub     ");
+  }
+  else if (millis() < meldingTot) {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, HIGH);
+
+    lcd.setCursor(0, 0);
+    lcd.print("                ");
+    lcd.setCursor(0, 0);
+    lcd.print(lijn1);
+
+    lcd.setCursor(0, 1);
+    lcd.print("                ");
+    lcd.setCursor(0, 1);
+    lcd.print(lijn2);
+  }
+  else if (aantal == 0) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(BLUE_LED, LOW);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Studieruimte   ");
+    lcd.setCursor(0, 1);
+    lcd.print("Vrij - ");
+    lcd.print(vrij);
+    lcd.print(" vrij   ");
+  }
+  else if (aantal < MAX_PERSONEN) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BLUE_LED, LOW);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Stille zone    ");
+    lcd.setCursor(0, 1);
+    lcd.print(aantal);
+    lcd.print("/");
+    lcd.print(MAX_PERSONEN);
+    lcd.print(" aanwezig   ");
+  }
+  else {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, LOW);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Ruimte vol     ");
+    lcd.setCursor(0, 1);
+    lcd.print("Kom later terug");
+  }
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN_SENSOR, INPUT_PULLUP);
+  pinMode(OUT_SENSOR, INPUT_PULLUP);
+  pinMode(SOUND_PIN, INPUT);
+
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(BLUE_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  lcd.begin(16, 2);
+  showTemp("Studieruimte", "Systeem start", 2000);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+
+  updateBlynkDisplay();
+  vorigeStatus = getStatusText();
+}
+
+// ---------- LOOP ----------
+void loop() {
+  Blynk.run();
+
+  handleButton();
+  handleCounter();
+  handleSound();
+  updateDisplayAndLeds();
+
+  if (millis() - lastBlynkUpdate > blynkUpdateInterval) {
+    updateBlynkDisplay();
+    lastBlynkUpdate = millis();
+  }
+}
